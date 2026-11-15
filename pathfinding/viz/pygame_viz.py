@@ -23,6 +23,7 @@ import pygame
 from pathfinding.algorithms.astar import astar
 from pathfinding.algorithms.dijkstra import dijkstra
 from pathfinding.algorithms.greedy_best_first import greedy_best_first
+from pathfinding.env.maps import random_grid
 
 ALGORITHMS = [("Dijkstra", dijkstra), ("Greedy", greedy_best_first), ("A*", astar)]
 
@@ -55,16 +56,8 @@ BUTTON_RECTS = [pygame.Rect(PANEL_LEFT + 20, 20 + i * 55, PANEL_WIDTH - 40, 42)
                 for i in range(len(ALGORITHMS))]
 
 
-def random_grid(rng):
-    """Random map with obstacles. Only maps where the goal is reachable are kept."""
-    while True:
-        grid = [[1 if rng.random() < OBSTACLE_DENSITY else 0 for _ in range(COLS)]
-                for _ in range(ROWS)]
-        grid[START[0]][START[1]] = 0
-        grid[GOAL[0]][GOAL[1]] = 0
-        path, _, _ = astar(grid, START, GOAL)
-        if path:
-            return grid
+def new_map(rng):
+    return random_grid(ROWS, COLS, OBSTACLE_DENSITY, rng, START, GOAL)
 
 
 class Visualizer:
@@ -72,7 +65,7 @@ class Visualizer:
 
     def __init__(self, seed=None):
         self.rng = random.Random(seed)
-        self.grid = random_grid(self.rng)
+        self.grid = new_map(self.rng)
         self.algorithm_index = 2  # start with A*
         self.run_search()
 
@@ -104,7 +97,7 @@ class Visualizer:
             elif event.key == pygame.K_SPACE:
                 self.restart_animation()
             elif event.key == pygame.K_r:
-                self.grid = random_grid(self.rng)
+                self.grid = new_map(self.rng)
                 self.run_search()
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             for index, rect in enumerate(BUTTON_RECTS):
