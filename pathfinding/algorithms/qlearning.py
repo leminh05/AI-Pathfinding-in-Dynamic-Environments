@@ -32,6 +32,11 @@ Each step of an episode:
 
 After training, the learned path is found by starting at the start and always
 taking the action with the highest Q-value (no more randomness).
+
+Two agents live in this file:
+    QLearningAgent         static map only, state = position
+    DynamicQLearningAgent  map with moving obstacles, trained and run inside
+                           the simulator (pathfinding/sim/simulator.py)
 """
 
 import random
@@ -39,6 +44,8 @@ import random
 import numpy as np
 
 from pathfinding.algorithms.dijkstra import FREE, check_start_and_goal
+from pathfinding.algorithms.greedy_best_first import manhattan_distance
+from pathfinding.sim.simulator import run_episode
 
 ACTIONS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 ACTION_NAMES = ["up", "down", "left", "right"]
@@ -46,6 +53,7 @@ ACTION_NAMES = ["up", "down", "left", "right"]
 GOAL_REWARD = 100
 OBSTACLE_REWARD = -10
 STEP_REWARD = -1
+COLLISION_REWARD = -100  # dynamic version only: hit by / walked into a moving obstacle
 
 
 class QLearningAgent:
@@ -160,6 +168,162 @@ def moving_average(values, window):
     """Average of each `window` consecutive values (smooths noisy curves)."""
     values = np.asarray(values, dtype=float)
     return np.convolve(values, np.ones(window) / window, mode="valid")
+
+
+class DynamicQLearningAgent:
+    """
+    Q-learning for a map with MOVING obstacles.
+
+    With only the position as state, the agent cannot see moving obstacles,
+    so it could never learn to avoid them. The state therefore also says
+    which nearby cells are dangerous, using the same "danger zone" idea as
+    the planners (a cell is dangerous if an obstacle is in it or next to it):
+
+        State   : (position, danger_bits)   danger_bits = 5 bits, one for each
+                  cell the agent can end up in (stay, up, down, left, right)
+        Actions : up, down, left, right, wait
+        Rewards : reach the goal                      -> +100 (episode ends)
+                  collide with a moving obstacle      -> -100 (episode ends)
+                  bump into a wall / grid edge        -> -10  (stays in place)
+                  any other move or wait              -> -1
+
+    The Q-table is a dictionary {state: [5 action values]}; a state the agent
+    has never seen has all values 0.
+
+    Reward shaping: with moving obstacles, a randomly exploring agent gets hit
+    long before it stumbles onto the goal, so the +100 is never found and
+    nothing is learned. During learning we therefore add a small bonus
+
+        shaping = discount * phi(next position) - phi(position),
+        phi(cell) = -(Manhattan distance from cell to goal)
+
+    (about +1 for a step toward the goal, -1 for a step away). This
+    "potential-based" shaping is proven not to change which policy is optimal
+    (Ng, Harada & Russell, 1999); it only makes learning much faster. The
+    reward reported per episode is the plain reward above, without the bonus.
+
+    Two more choices that matter (both found by experiment):
+    - discount = 0.99, not 0.95: a 40-step route needs a long horizon, and with
+      0.95 the shaping bonus for standing still outweighs the step cost, so the
+      agent learns to wait forever.
+    - curriculum: training starts with episodes WITHOUT moving obstacles (see
+      train()), otherwise collisions end almost every early episode and the
+      goal is never found.
+
+    The agent is used by run_episode() like the planners: the simulator asks
+    next_cell() where to go, then reports what happened with after_step(),
+    which is where the Q-learning update happens.
+    """
+
+    ACTIONS = ACTIONS + [(0, 0)]  # up, down, left, right, wait
+    REWARDS = {"goal": GOAL_REWARD, "collision": COLLISION_REWARD,
+               "bump": OBSTACLE_REWARD, "move": STEP_REWARD, "wait": STEP_REWARD}
+
+    def __init__(self, learning_rate=0.1, discount=0.99, epsilon_start=1.0,
+                 epsilon_end=0.05, epsilon_decay=0.998, seed=None):
+        self.learning_rate = learning_rate
+        self.discount = discount
+        self.epsilon = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay = epsilon_decay
+        self.rng = random.Random(seed)
+        self.q_table = {}
+        self.training = False  # True: explore and learn. False: just act greedily.
+        self.last_state = None
+        self.last_action = None
+        self.episode_reward = 0
+
+    @staticmethod
+    def observe(position, occupied):
+        """
+        State = (position, danger_bits). danger_bits has one bit for each cell
+        the agent could be in after this step (its own cell, up, down, left,
+        right); the bit is 1 if an obstacle is in that cell or right next to
+        it, i.e. an obstacle could be there after the obstacles move.
+        """
+        row, col = position
+        danger_bits = 0
+        for bit, (row_change, col_change) in enumerate([(0, 0)] + ACTIONS):
+            cell = (row + row_change, col + col_change)
+            near_cells = [cell] + [(cell[0] + dr, cell[1] + dc) for dr, dc in ACTIONS]
+            if any(near in occupied for near in near_cells):
+                danger_bits |= 1 << bit
+        return position, danger_bits
+
+    def q_values(self, state):
+        if state not in self.q_table:
+            self.q_table[state] = np.zeros(len(self.ACTIONS))
+        return self.q_table[state]
+
+    def best_action(self, state):
+        """Action with the highest Q-value (random choice among ties)."""
+        values = self.q_values(state)
+        best_actions = np.flatnonzero(values == values.max())
+        return int(best_actions[self.rng.randrange(len(best_actions))])
+
+    # --- the three methods the simulator calls -------------------------------
+
+    def reset(self):
+        self.last_state = None
+        self.last_action = None
+        self.episode_reward = 0
+
+    def next_cell(self, grid, position, goal, occupied, result):
+        self.goal = goal
+        state = self.observe(position, occupied)
+        if self.training and self.rng.random() < self.epsilon:
+            action = self.rng.randrange(len(self.ACTIONS))  # explore
+        else:
+            action = self.best_action(state)                # exploit
+        self.last_state, self.last_action = state, action
+        row_change, col_change = self.ACTIONS[action]
+        return position[0] + row_change, position[1] + col_change
+
+    def after_step(self, position, occupied, event):
+        reward = self.REWARDS[event]
+        self.episode_reward += reward
+        if not self.training:
+            return
+        # Reward shaping: a small bonus for getting closer to the goal (see class doc).
+        old_position = self.last_state[0]
+        shaping = (self.discount * -manhattan_distance(position, self.goal)
+                   + manhattan_distance(old_position, self.goal))
+
+        # Q-learning update, same rule as the static agent.
+        done = event in ("goal", "collision")
+        future_value = 0 if done else self.q_values(self.observe(position, occupied)).max()
+        target = reward + shaping + self.discount * future_value
+        values = self.q_values(self.last_state)
+        values[self.last_action] += self.learning_rate * (target - values[self.last_action])
+
+    # --- training ---------------------------------------------------------------
+
+    def train(self, grid, start, goal, make_obstacles, episodes, first_seed=0):
+        """
+        Train for `episodes` episodes on one map.
+
+        make_obstacles(rng) must return a fresh list of moving obstacles; every
+        episode gets a different layout and movement (seeds first_seed,
+        first_seed + 1, ...), so the agent learns to react to obstacles instead
+        of memorising one particular run.
+
+        Returns (episode_rewards, episode_successes, episode_collisions).
+        """
+        episode_rewards, episode_successes, episode_collisions = [], [], []
+        self.training = True
+        # Curriculum: the first 20% of episodes have no moving obstacles, so the
+        # agent first learns the route to the goal, then learns to dodge.
+        warmup_episodes = episodes // 5
+        for episode in range(episodes):
+            seed = first_seed + episode
+            obstacles = [] if episode < warmup_episodes else make_obstacles(random.Random(seed))
+            result = run_episode(grid, start, goal, obstacles, self, seed=seed)
+            episode_rewards.append(self.episode_reward)
+            episode_successes.append(result.success)
+            episode_collisions.append(result.collided)
+            self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
+        self.training = False
+        return episode_rewards, episode_successes, episode_collisions
 
 
 if __name__ == "__main__":

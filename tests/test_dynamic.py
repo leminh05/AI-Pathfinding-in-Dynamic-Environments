@@ -75,6 +75,7 @@ def test_episodes_are_consistent():
         for search in (dijkstra, greedy_best_first, astar):
             result = run_episode(grid, START, GOAL, obstacles, search, seed=seed)
             assert not (result.success and result.collided)
+            assert result.bumps == 0  # planners never walk into walls
             assert result.steps == result.moves + result.waits == len(result.trajectory) - 1
             for (r1, c1), (r2, c2) in zip(result.trajectory, result.trajectory[1:]):
                 assert abs(r1 - r2) + abs(c1 - c2) <= 1  # one move or a wait
